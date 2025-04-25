@@ -1,0 +1,18 @@
+# Java
+*.class
+*.log
+*.jar
+*.war
+*.ear
+target/
+.idea/
+*.iml
+*.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+*.yml
