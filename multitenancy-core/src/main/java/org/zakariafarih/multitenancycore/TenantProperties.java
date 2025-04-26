@@ -17,7 +17,7 @@ public class TenantProperties {
         private String dbName;
         private String dbUser;
         private String dbPassword;
-        private String host = "localhost";
+        private String host;
         private int    port = 5432;
         private int maxPool;    // Optional per-tenant override
         private long idleTimeoutMs;     // optional

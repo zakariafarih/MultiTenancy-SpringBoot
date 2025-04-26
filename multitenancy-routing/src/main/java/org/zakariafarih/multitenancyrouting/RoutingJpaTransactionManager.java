@@ -1,51 +1,93 @@
 package org.zakariafarih.multitenancyrouting;
 
+import com.github.benmanes.caffeine.cache.*;
 import jakarta.persistence.EntityManagerFactory;
-import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.orm.jpa.JpaTransactionManager;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.TransactionException;
-import org.springframework.transaction.TransactionStatus;
-import org.zakariafarih.multitenancycore.TenantContext;
+import org.springframework.transaction.*;
+import org.zakariafarih.multitenancycore.*;
 
 import javax.sql.DataSource;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Delegates to a cached {@link JpaTransactionManager} for the *current* tenant.
- * The first schema registered for the service becomes the default; entities
- * may still declare a @Table(schema=…).
+ * One {@link JpaTransactionManager} per tenant, cached with Caffeine.
+ * Eviction closes the underlying EntityManagerFactory to prevent leaks.
  */
-@RequiredArgsConstructor
-public class RoutingJpaTransactionManager implements PlatformTransactionManager {
+@Slf4j
+public class RoutingJpaTransactionManager
+        implements PlatformTransactionManager, DisposableBean {
 
     private final TenantDataSourceManager     dsm;
     private final EntityManagerFactoryManager emfm;
-    private final String[]                    serviceSchemas;   // injected from properties
+    private final String[]                    serviceSchemas;
+    private final MultitenancyPoolProperties  poolProps;
 
-    private final Map<String, JpaTransactionManager> cache = new ConcurrentHashMap<>();
+    /* holder keeps a reference to close EMF on eviction */
+    private record Holder(JpaTransactionManager tm, EntityManagerFactory emf) {}
 
-    private JpaTransactionManager delegate() {
-        String tenant = TenantContext.getRequired();
+    private final LoadingCache<String, Holder> cache;
 
-        return cache.computeIfAbsent(tenant, id -> {
-            DataSource ds  = dsm.get(id);
-            /* Choose first service schema as 'default'; it only affects
-               hibernate.default_schema, not @Table-explicit entities. */
-            String defaultSchema = serviceSchemas[0];
-            EntityManagerFactory emf = emfm.get(ds, id, defaultSchema);
-            return new JpaTransactionManager(emf);
-        });
+    public RoutingJpaTransactionManager(TenantDataSourceManager dsm,
+                                        EntityManagerFactoryManager emfm,
+                                        String[] serviceSchemas,
+                                        MultitenancyPoolProperties poolProps) {
+
+        this.dsm            = dsm;
+        this.emfm           = emfm;
+        this.serviceSchemas = serviceSchemas;
+        this.poolProps      = poolProps;
+
+        this.cache = Caffeine.newBuilder()
+                .maximumSize(poolProps.getMaxTenantPools())
+                .expireAfterAccess(poolProps.getIdleEviction())
+                .removalListener(this::closeOnEvict)
+                .build(this::create);
     }
 
-    @Override public TransactionStatus getTransaction(TransactionDefinition d)
-            throws TransactionException { return delegate().getTransaction(d); }
+    /* ---------- PlatformTransactionManager ---------- */
 
-    @Override public void commit(TransactionStatus s)
-            throws TransactionException { delegate().commit(s); }
+    @Override
+    public TransactionStatus getTransaction(TransactionDefinition def)
+            throws TransactionException {
+        return delegate().getTransaction(def);
+    }
 
-    @Override public void rollback(TransactionStatus s)
-            throws TransactionException { delegate().rollback(s); }
+    @Override
+    public void commit(TransactionStatus status) throws TransactionException {
+        delegate().commit(status);
+    }
+
+    @Override
+    public void rollback(TransactionStatus status) throws TransactionException {
+        delegate().rollback(status);
+    }
+
+    /* ---------- lifecycle ---------- */
+
+    @Override
+    public void destroy() {
+        cache.invalidateAll();
+        cache.cleanUp(); // forces removal listener -> EMF.close()
+    }
+
+    /* ---------- helpers ---------- */
+
+    private Holder create(String tenantId) {
+        DataSource ds = dsm.get(tenantId);
+        String defaultSchema = serviceSchemas[0];
+        EntityManagerFactory emf = emfm.get(ds, tenantId, defaultSchema);
+        return new Holder(new JpaTransactionManager(emf), emf);
+    }
+
+    private void closeOnEvict(String tenant, Holder holder, RemovalCause cause) {
+        if (holder != null && holder.emf().isOpen()) {
+            holder.emf().close();
+            log.info("Closed EMF for tenant {} (cause: {})", tenant, cause);
+        }
+    }
+
+    private JpaTransactionManager delegate() {
+        return cache.get(TenantContext.getRequired()).tm();
+    }
 }

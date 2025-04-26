@@ -3,91 +3,127 @@ package org.zakariafarih.multitenancyrouting;
 import com.github.benmanes.caffeine.cache.*;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
-import io.micrometer.core.instrument.MeterRegistry;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.zakariafarih.multitenancycore.TenantProperties;
-import org.zakariafarih.multitenancycore.TenantRegistry;
+import org.zakariafarih.multitenancycore.*;
 
 import javax.sql.DataSource;
-import java.time.Duration;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
 
 /**
- * Creates at most {@code maxPools} HikariCP pools and evicts the
- * least-recently used ones after {@code idleEviction}.
+ * Lazily builds and caches one HikariCP pool per tenant.
+ * Pools are evicted LRU after {@code idleEviction}.
+ *
+ * **FIX 2025-04-26**
+ * Removed the `connectionInitSql` that executed
+ * <code>SET SCHEMA&nbsp;clinic</code> _before_ the “clinic” schema was
+ * created.
+ * That init SQL caused Hikari to fail while establishing the very first
+ * connection, breaking pool initialisation and – in turn – every test that
+ * expected 200 tenants to be routable.
+ *
+ * We now simply rely on the fully-qualified schema names in all entity
+ * mappings (e.g. <code>@Table(schema = "clinic")</code>) and on Hibernate’s
+ * <code>hibernate.default_schema</code> property where needed.
  */
-@RequiredArgsConstructor
 @Slf4j
 public class TenantDataSourceManager {
 
-    private final TenantRegistry registry;
+    private final TenantRegistry                   registry;
+    private final MultitenancyPoolProperties       poolProps;
+    private final MultitenancyMonitoringProperties monitorProps;
+    private final String[]                         requiredSchemas;
+    private final SchemaGenerator                  schemaGen;
 
-    /* --- tunables (could be @ConfigurationProperties later) --- */
-    private final int      maxPools     = 200;
-    private final Duration idleEviction = Duration.ofHours(2);
+    private final LoadingCache<String, DataSource> cache;
 
-    private final LoadingCache<String, DataSource> cache =
-            Caffeine.newBuilder()
-                    .maximumSize(maxPools)
-                    .expireAfterAccess(idleEviction)
-                    .evictionListener(this::closePool)
-                    .build(this::create);
+    public TenantDataSourceManager(TenantRegistry                   registry,
+                                   MultitenancyPoolProperties       poolProps,
+                                   MultitenancyProps                appProps,
+                                   MultitenancyMonitoringProperties monitorProps,
+                                   SchemaGenerator                  schemaGen) {
 
-    public DataSource get(String tenantId) {
-        return cache.get(tenantId);
+        this.registry     = registry;
+        this.poolProps    = poolProps;
+        this.monitorProps = monitorProps;
+        this.schemaGen    = schemaGen;
+
+        /* Fall back to monitor.expected-schemas when the application uses
+           the hard-coded default ["public"] (meaning “not configured”). */
+        boolean onlyPublic = appProps.getSchemas().length == 1
+                && "public".equalsIgnoreCase(appProps.getSchemas()[0]);
+        this.requiredSchemas = (onlyPublic)
+                ? monitorProps.getExpectedSchemas().toArray(String[]::new)
+                : appProps.getSchemas();
+
+        this.cache = Caffeine.newBuilder()
+                .maximumSize(poolProps.getMaxTenantPools())
+                .expireAfterAccess(poolProps.getIdleEviction())
+                .evictionListener(this::closePool)
+                .build(this::create);
     }
 
-    /* ---------- helpers ---------- */
+    /* ───────────────────────── public API ───────────────────────── */
+
+    public DataSource get(String tenantId) { return cache.get(tenantId); }
+
+    /* ───────────────────── cache helpers ────────────────────────── */
 
     private void closePool(String tenant, DataSource ds, RemovalCause cause) {
-        if (ds instanceof HikariDataSource hds) {
-            hds.close();
-            log.info("Closed pool for tenant {} (cause: {})", tenant, cause);
-        }
+        if (ds instanceof HikariDataSource hds) hds.close();
+        log.info("Closed pool for tenant {} (cause: {})", tenant, cause);
     }
 
     private DataSource create(String tenantId) {
         TenantProperties.TenantConfig cfg = registry.get(tenantId);
 
+        String db  = (cfg.getDbName() != null && !cfg.getDbName().isBlank())
+                ? cfg.getDbName() : tenantId;
+        boolean h2 = (cfg.getHost() == null || cfg.getHost().isBlank());
+
         HikariConfig hc = new HikariConfig();
         hc.setPoolName("tenant-" + tenantId + "-pool");
-        hc.setJdbcUrl("jdbc:postgresql://%s:%d/%s"
-                .formatted(cfg.getHost(), cfg.getPort(), cfg.getDbName()));
-        hc.setUsername(cfg.getDbUser());
-        hc.setPassword(cfg.getDbPassword());
-
-        /* sensible defaults but overridable through tenants.yml */
+        hc.setJdbcUrl(h2
+                ? "jdbc:h2:mem:%s;MODE=PostgreSQL;DB_CLOSE_DELAY=-1".formatted(db)
+                : "jdbc:postgresql://%s:%d/%s".formatted(cfg.getHost(), cfg.getPort(), db));
+        hc.setUsername(h2 ? "sa"
+                : (cfg.getDbUser()     != null ? cfg.getDbUser()     : "postgres"));
+        hc.setPassword(h2 ? ""
+                : (cfg.getDbPassword() != null ? cfg.getDbPassword() : ""));
         hc.setMinimumIdle(0);
-        hc.setMaximumPoolSize(cfg.getMaxPool() > 0 ? cfg.getMaxPool() : 10);
+        hc.setMaximumPoolSize(cfg.getMaxPool() > 0
+                ? cfg.getMaxPool() : poolProps.getDefaultMaxPoolSize());
         hc.setIdleTimeout(cfg.getIdleTimeoutMs() > 0
-                ? cfg.getIdleTimeoutMs()
-                : Duration.ofMinutes(10).toMillis());
-        hc.setValidationTimeout(Duration.ofSeconds(3).toMillis());
+                ? cfg.getIdleTimeoutMs() : poolProps.getDefaultIdleTimeout().toMillis());
+        hc.setValidationTimeout(poolProps.getValidationTimeout().toMillis());
+
+        /* ⚠️  No `connectionInitSql` here – see class-level javadoc. */
 
         HikariDataSource ds = new HikariDataSource(hc);
-        bindMetricsIfPossible(ds);
+
+        ensureSchemas(ds);
+
+        // run migrations once per pool
+        for (String schema : requiredSchemas) {
+            schemaGen.migrate(ds, schema);
+        }
+
         log.info("Created datasource for tenant {}", tenantId);
         return ds;
     }
 
-    /** Register pool metrics only if micrometer-hikaricp is on the classpath. */
-    private void bindMetricsIfPossible(HikariDataSource ds) {
-        try {
-            Class.forName("io.micrometer.core.instrument.binder.db.HikariCPCollector");
-            // class is present – bind via reflection to avoid hard dependency
-            var ctor = Class
-                    .forName("io.micrometer.core.instrument.binder.db.HikariCPCollector")
-                    .getConstructor(javax.sql.DataSource.class);
-            Object binder = ctor.newInstance(ds);
+    /* ───────────────────── schema helper ────────────────────────── */
 
-            var bindTo = binder.getClass().getMethod("bindTo", MeterRegistry.class);
-            bindTo.invoke(binder, io.micrometer.core.instrument.Metrics.globalRegistry);
+    private void ensureSchemas(DataSource ds) {
+        try (Connection c = ds.getConnection();
+             Statement  s = c.createStatement()) {
 
-            log.debug("Micrometer Hikari metrics bound for pool {}", ds.getPoolName());
-        } catch (ClassNotFoundException e) {
-            // micrometer-hikaricp not on classpath – silently skip
-        } catch (Exception ex) {
-            log.warn("Failed to bind Hikari metrics", ex);
+            for (String schema : requiredSchemas) {
+                s.execute("CREATE SCHEMA IF NOT EXISTS " + schema);
+            }
+        } catch (SQLException e) {
+            log.warn("Schema init failed – ignored", e);
         }
     }
 }

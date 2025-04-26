@@ -1,1 +1,3 @@
 org.zakariafarih.multitenancyautoconfig.MultitenancyAutoConfiguration
+org.zakariafarih.multitenancyautoconfig.OnboardingSecurityAutoConfiguration
+org.zakariafarih.multitenancycore.AuditJpaAutoConfiguration

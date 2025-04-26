@@ -19,7 +19,7 @@ public final class TenantContext {
     public static String getRequired() {
         String id = CURRENT.get();
         if (id == null) {
-            throw new IllegalStateException("No tenant id bound to the current thread");
+            throw new TenantNotResolvedException();
         }
         return id;
     }

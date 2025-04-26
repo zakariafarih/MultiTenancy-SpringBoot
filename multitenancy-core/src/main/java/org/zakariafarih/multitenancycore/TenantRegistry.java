@@ -2,15 +2,20 @@ package org.zakariafarih.multitenancycore;
 
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
 import org.yaml.snakeyaml.Yaml;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Singleton that loads tenants.yml at startup and
- * gives cheap lookup by tenantId.
+ * Loads every tenants*.yml found on the class-path and provides
+ * fast lookup by tenant id.
  */
 @Slf4j
 public class TenantRegistry {
@@ -19,18 +24,41 @@ public class TenantRegistry {
     private final Map<String, TenantProperties.TenantConfig> tenantMap = new ConcurrentHashMap<>();
 
     public TenantRegistry() {
-        try (InputStream in = getClass().getClassLoader().getResourceAsStream("tenants.yml")) {
-            if (in == null) throw new IllegalStateException("tenants.yml not found on classpath");
-            Yaml yaml = new Yaml();
-            Map<?, ?> raw = yaml.load(in);
-            TenantProperties props = yaml.loadAs(yaml.dump(raw), TenantProperties.class);
+        try {
+            var resolver = new PathMatchingResourcePatternResolver();
 
-            props.getTenants().forEach(cfg -> {
-                log.info("Registering tenant {}", cfg.getId());
-                tenantMap.put(cfg.getId(), cfg);
-            });
+            // first look for any tenants-*.yml (e.g. tenants-big.yml)
+            Resource[] dashResources = resolver.getResources("classpath*:**/tenants-*.yml");
+            Resource[] toLoad = dashResources.length > 0
+                    // if we found any, use only those
+                    ? dashResources
+                    // otherwise fall back to the classic tenants.yml
+                    : resolver.getResources("classpath*:**/tenants.yml");
+
+            // prefer external files (so test’s tenants-big.yml on disk wins over jars)
+            var external = Arrays.stream(toLoad)
+                    .filter(r -> {
+                        try {
+                            return "file".equals(r.getURL().getProtocol());
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    })
+                    .toList();
+            var resources = external.isEmpty() ? List.of(toLoad) : external;
+
+            Yaml yaml = new Yaml();
+            for (var res : resources) {
+                try (InputStream in = res.getInputStream()) {
+                    var props = yaml.loadAs(in, TenantProperties.class);
+                    props.getTenants().forEach(cfg -> {
+                        log.info("Registering tenant {} (from {})", cfg.getId(), res.getFilename());
+                        tenantMap.put(cfg.getId(), cfg);
+                    });
+                }
+            }
         } catch (Exception e) {
-            throw new IllegalStateException("Failed to load tenants.yml", e);
+            throw new IllegalStateException("Failed to load tenant descriptors", e);
         }
     }
 

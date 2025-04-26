@@ -3,7 +3,7 @@ package org.zakariafarih.cliniccore;
 import lombok.RequiredArgsConstructor;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
-import org.zakariafarih.multitenancyrepo.TenantRepositoryFactory;
+import org.zakariafarih.multitenancyrouting.TenantRepositoryFactory;
 
 import java.util.List;
 
